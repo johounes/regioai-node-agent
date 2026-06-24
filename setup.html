@@ -1,0 +1,149 @@
+<!doctype html>
+<html lang="de">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Node verbinden – Community AI Grid</title>
+    <style>
+      :root { --teal: #028090; --teal-dark: #026070; --navy: #1c3a5e; --accent: #02c39a; }
+      * { box-sizing: border-box; }
+      body {
+        margin: 0; min-height: 100vh; display: flex; align-items: center; justify-content: center;
+        font-family: system-ui, -apple-system, sans-serif; color: var(--navy);
+        background: linear-gradient(135deg, #02809010, #fff 40%, #02c39a10);
+        padding: 16px;
+      }
+      .card { width: 100%; max-width: 440px; background: #fff; border: 1px solid #1c3a5e1a;
+        border-radius: 18px; box-shadow: 0 10px 30px #1c3a5e14; padding: 32px; }
+      .brand { font-weight: 700; color: var(--teal); font-size: 18px; margin-bottom: 18px; }
+      h1 { font-size: 22px; margin: 0 0 6px; }
+      p.sub { color: #1c3a5e99; margin: 0 0 20px; font-size: 14px; }
+      label { display: block; font-size: 13px; font-weight: 600; margin: 12px 0 4px; }
+      input { width: 100%; padding: 10px 12px; border: 1px solid #1c3a5e26; border-radius: 9px;
+        font-size: 14px; outline: none; }
+      input:focus { border-color: var(--teal); box-shadow: 0 0 0 3px #02809022; }
+      .btn { display: inline-block; width: 100%; text-align: center; margin-top: 18px; padding: 11px 16px;
+        background: var(--teal); color: #fff; border: 0; border-radius: 9px; font-size: 14px; font-weight: 600;
+        cursor: pointer; text-decoration: none; }
+      .btn:hover { background: var(--teal-dark); }
+      .btn[disabled] { opacity: 0.6; cursor: default; }
+      .detected { display: flex; gap: 6px; align-items: center; background: #1c3a5e08; border-radius: 8px;
+        padding: 8px 10px; font-size: 12px; color: #1c3a5e99; margin-bottom: 6px; }
+      .error { background: #fee2e2; color: #b91c1c; padding: 9px 12px; border-radius: 8px; font-size: 13px; margin-top: 12px; }
+      .ok { text-align: center; }
+      .ok svg { color: var(--accent); }
+      .row { display: flex; gap: 12px; }
+      .row > div { flex: 1; }
+      .muted { color: #1c3a5e66; font-weight: 400; }
+    </style>
+  </head>
+  <body>
+    <div class="card" id="app"><p class="sub">Lädt …</p></div>
+
+    <script type="module">
+      import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
+
+      const app = document.getElementById("app");
+      let platformUrl = "";
+      let hints = {};
+      let sb = null;
+
+      const esc = (s) => (s ?? "").toString().replace(/[<>&"]/g, (c) =>
+        ({ "<": "&lt;", ">": "&gt;", "&": "&amp;", '"': "&quot;" }[c]));
+
+      async function init() {
+        try {
+          const status = await (await fetch("/api/local/status")).json();
+          platformUrl = status.platformUrl;
+          hints = status.hints || {};
+          if (status.enrolled) return renderConnected();
+          const cfg = await (await fetch(platformUrl + "/api/agent/config")).json();
+          if (!cfg.supabaseUrl || !cfg.anonKey) throw new Error("Plattform-Konfiguration unvollständig.");
+          sb = createClient(cfg.supabaseUrl, cfg.anonKey);
+          renderLogin();
+        } catch (e) {
+          app.innerHTML =
+            '<div class="brand">Community AI Grid</div><h1>Plattform nicht erreichbar</h1>' +
+            '<p class="sub">' + esc(e.message) + " Läuft die Plattform und stimmt CAG_GATEWAY?</p>";
+        }
+      }
+
+      function renderConnected() {
+        app.innerHTML =
+          '<div class="brand">Community AI Grid</div>' +
+          "<h1>Node ist verbunden</h1>" +
+          '<p class="sub">Diese Node ist bereits registriert und sendet Heartbeats.</p>' +
+          '<a class="btn" href="' + platformUrl + '/login?redirect=/dashboard/operator">Zum Operator-Dashboard</a>';
+      }
+
+      function renderLogin() {
+        app.innerHTML =
+          '<div class="brand">Community AI Grid</div>' +
+          "<h1>Node verbinden</h1>" +
+          '<p class="sub">Melde dich mit deinem Operator-Konto an – deine Node wird automatisch registriert.</p>' +
+          (hints.gpu_model
+            ? '<div class="detected">🖥️ Erkannt: ' + esc(hints.gpu_model) +
+              (hints.gpu_count > 1 ? " ×" + hints.gpu_count : "") + "</div>"
+            : "") +
+          '<label>E-Mail</label><input id="email" type="email" placeholder="name@firma.de" />' +
+          '<label>Passwort</label><input id="password" type="password" placeholder="••••••••" />' +
+          '<label>Node-Name</label><input id="name" value="' + esc(hints.hostname || "Meine Node") + '" />' +
+          '<label>Stadt <span class="muted">(optional)</span></label><input id="city" placeholder="z.B. Mainz" />' +
+          '<button class="btn" id="go">Anmelden &amp; Node verbinden</button>' +
+          '<div id="err"></div>';
+        document.getElementById("go").addEventListener("click", connect);
+      }
+
+      function showError(msg) {
+        const e = document.getElementById("err");
+        if (e) e.innerHTML = '<div class="error">' + esc(msg) + "</div>";
+      }
+
+      async function connect() {
+        const btn = document.getElementById("go");
+        btn.disabled = true;
+        btn.textContent = "Verbinde …";
+        document.getElementById("err").innerHTML = "";
+        const email = document.getElementById("email").value.trim();
+        const password = document.getElementById("password").value;
+        try {
+          const { data, error } = await sb.auth.signInWithPassword({ email, password });
+          if (error || !data.session) throw new Error(error?.message === "Invalid login credentials"
+            ? "E-Mail oder Passwort ist falsch." : (error?.message || "Login fehlgeschlagen."));
+
+          const res = await fetch(platformUrl + "/api/agent/enroll", {
+            method: "POST",
+            headers: { "Content-Type": "application/json", Authorization: "Bearer " + data.session.access_token },
+            body: JSON.stringify({
+              name: document.getElementById("name").value,
+              city: document.getElementById("city").value,
+              gpuModel: hints.gpu_model || "Andere",
+              gpuCount: hints.gpu_count || 1,
+            }),
+          });
+          const enrolled = await res.json();
+          if (!res.ok || !enrolled.node_id) throw new Error(enrolled.error || "Registrierung fehlgeschlagen.");
+
+          const done = await fetch("/api/local/complete", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ node_id: enrolled.node_id, node_key: enrolled.node_key }),
+          });
+          if (!done.ok) throw new Error("Agent konnte Credentials nicht speichern.");
+
+          app.innerHTML =
+            '<div class="ok"><svg width="56" height="56" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/></svg>' +
+            "<h1>Node verbunden!</h1>" +
+            '<p class="sub">Deine Node ist registriert und sendet jetzt Heartbeats.</p>' +
+            '<a class="btn" href="' + platformUrl + '/login?redirect=/dashboard/operator">Zum Operator-Dashboard</a></div>';
+        } catch (e) {
+          showError(e.message);
+          btn.disabled = false;
+          btn.innerHTML = "Anmelden &amp; Node verbinden";
+        }
+      }
+
+      init();
+    </script>
+  </body>
+</html>

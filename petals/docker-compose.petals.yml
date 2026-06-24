@@ -1,0 +1,66 @@
+# Privater Petals-Swarm (DHT-Bootstrap + Server + Swarm-API).
+# Host-Networking, damit Bootstrap-Peer und API ohne NAT erreichbar sind
+# (konsistent mit dem übrigen Node-Stack).
+#
+#   docker compose -f docker-compose.petals.yml up -d --build
+#
+# Hinweis: Auf einer einzelnen 11-GB-GPU ggf. Ollama vorher pausieren
+#   (docker compose stop ollama im node-agent/-Ordner), damit der Server
+#   alle Blöcke laden kann.
+
+services:
+  petals-dht:
+    build: .
+    network_mode: host
+    restart: unless-stopped
+    volumes:
+      - swarm:/swarm
+    environment:
+      DHT_PORT: ${DHT_PORT:-31337}
+    command: /app/entrypoint-bootstrap.sh
+
+  petals-server:
+    build: .
+    network_mode: host
+    restart: unless-stopped
+    depends_on:
+      - petals-dht
+    volumes:
+      - swarm:/swarm
+      - hf-cache:/root/.cache/huggingface
+    environment:
+      CAG_SWARM_MODEL: ${CAG_SWARM_MODEL:-NousResearch/Llama-2-7b-hf}
+      NUM_BLOCKS: ${NUM_BLOCKS:-}
+    command: /app/entrypoint-server.sh
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+  petals-api:
+    build: .
+    network_mode: host
+    restart: unless-stopped
+    depends_on:
+      - petals-server
+    volumes:
+      - swarm:/swarm
+      - hf-cache:/root/.cache/huggingface
+    environment:
+      CAG_SWARM_MODEL: ${CAG_SWARM_MODEL:-NousResearch/Llama-2-7b-hf}
+      SWARM_API_PORT: ${SWARM_API_PORT:-8077}
+    command: python -u swarm_api.py
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+volumes:
+  swarm:
+  hf-cache:

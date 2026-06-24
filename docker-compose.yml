@@ -1,0 +1,66 @@
+# Community AI Grid – One-Click Node-Setup
+#
+#   1. docker compose up -d
+#   2. Browser auf der Node öffnen:  http://localhost:8088
+#      → anmelden, die Node registriert sich automatisch.
+#   (Alternativ CAG_NODE_ID + CAG_NODE_KEY in .env setzen → kein Setup nötig.)
+#
+# Diese Variante nutzt HOST-NETWORKING (ideal, wenn Plattform, Ollama und Agent
+# auf EINER Linux-Maschine laufen): die Container erreichen den Dev-Server und
+# Ollama direkt über localhost – ohne NAT/Firewall-Stolpersteine.
+#
+# Auf macOS/Windows funktioniert host-networking anders – dort stattdessen die
+# Bridge-Variante nutzen (network_mode entfernen, ports + extra_hosts setzen und
+# CAG_GATEWAY=http://host.docker.internal:3000, OLLAMA_URL=http://ollama:11434).
+
+services:
+  ollama:
+    image: ollama/ollama:latest
+    restart: unless-stopped
+    network_mode: host
+    volumes:
+      - ollama:/root/.ollama
+    # GPU-Zugriff (benötigt NVIDIA Container Toolkit)
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+  agent:
+    build: .
+    restart: unless-stopped
+    network_mode: host
+    depends_on:
+      - ollama
+    volumes:
+      - agent-data:/data
+    environment:
+      CAG_GATEWAY: ${CAG_GATEWAY:-http://localhost:3000}
+      # Leer lassen → Device-Pairing beim ersten Start (Credentials landen in /data)
+      CAG_NODE_ID: ${CAG_NODE_ID:-}
+      CAG_NODE_KEY: ${CAG_NODE_KEY:-}
+      CAG_CREDENTIALS_FILE: /data/credentials.json
+      CAG_MODEL: ${CAG_MODEL:-llama3:8b}
+      OLLAMA_URL: ${OLLAMA_URL:-http://localhost:11434}
+      CAG_PUBLIC_URL: ${CAG_PUBLIC_URL:-http://localhost:8088}
+      PORT: 8088
+      HEARTBEAT_INTERVAL: ${HEARTBEAT_INTERVAL:-60}
+      CAG_GPU_MEMORY_MB: ${CAG_GPU_MEMORY_MB:-24576}
+      # nötig, damit das Toolkit nvidia-smi + NVML einhängt (echte Telemetrie)
+      NVIDIA_VISIBLE_DEVICES: all
+      NVIDIA_DRIVER_CAPABILITIES: utility
+    # GPU-Zugriff für den Agent (nur zum Auslesen der GPU-Statistik)
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu, utility]
+
+volumes:
+  ollama:
+  agent-data:
