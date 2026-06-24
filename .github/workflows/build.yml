@@ -1,4 +1,3 @@
-'EOF'
 name: Build & Push Node-Agent
 
 on:
@@ -31,4 +30,4 @@ jobs:
           tags: |
             ghcr.io/johounes/regioai-node-agent:latest
             ghcr.io/johounes/regioai-node-agent:sha-${{ github.sha }}
-EOF
+
