@@ -13,9 +13,9 @@
  */
 
 import { createServer } from "node:http";
-import { execFile } from "node:child_process";
+import { execFile, execSync } from "node:child_process";
 import { readFileSync, writeFileSync, existsSync, unlinkSync } from "node:fs";
-import { hostname } from "node:os";
+import { hostname, totalmem } from "node:os";
 import { fileURLToPath } from "node:url";
 
 try {
@@ -82,6 +82,70 @@ function getGpuInfo() {
       resolve({ name: names[0] ?? null, count: names.length || 1 });
     });
   });
+}
+
+const isMac = process.platform === "darwin";
+
+/**
+ * Erkennt Apple-Silicon-Hardware via sysctl (Fallback: system_profiler).
+ * Unified Memory zählt als VRAM. Gibt null zurück, wenn kein Apple-Chip
+ * gefunden wird (z.B. Intel-Mac → CPU-Modus) oder die Befehle fehlschlagen.
+ */
+function getAppleSiliconInfo() {
+  try {
+    const chip = execSync(
+      "sysctl -n machdep.cpu.brand_string 2>/dev/null || " +
+        "system_profiler SPHardwareDataType | grep 'Chip' | awk -F': ' '{print $2}'",
+      { timeout: 3000 },
+    )
+      .toString()
+      .trim();
+
+    // Nur echte Apple-Silicon-Chips ("Apple M…") behandeln; Intel-Macs → CPU.
+    if (!/apple/i.test(chip)) return null;
+
+    const memBytes = execSync("sysctl -n hw.memsize", { timeout: 3000 })
+      .toString()
+      .trim();
+    const memGB = Math.round(parseInt(memBytes, 10) / 1024 / 1024 / 1024);
+
+    return {
+      gpu_model: chip || "Apple Silicon",
+      gpu_count: 1,
+      ram_gb: memGB,
+      gpu_memory_total_mb: memGB * 1024, // Unified Memory = VRAM
+      hardware_type: "apple_silicon",
+    };
+  } catch {
+    return null;
+  }
+}
+
+// Hardware-Infos einmalig ermitteln und cachen (ändern sich zur Laufzeit nicht).
+let hwInfo = null;
+async function getHardwareInfo() {
+  if (!hwInfo) {
+    if (isMac) {
+      const apple = getAppleSiliconInfo();
+      hwInfo = apple ?? {
+        // Mac ohne Apple-Silicon (Intel) → CPU-Modus
+        gpu_model: null,
+        gpu_count: 1,
+        ram_gb: Math.round(totalmem() / 1024 ** 3),
+        hardware_type: "cpu",
+      };
+    } else {
+      // Linux/Windows: bestehende nvidia-smi-Logik unverändert
+      const gpu = await getGpuInfo();
+      hwInfo = {
+        gpu_model: gpu.name,
+        gpu_count: gpu.count,
+        ram_gb: Math.round(totalmem() / 1024 ** 3),
+        hardware_type: gpu.name ? "nvidia" : "cpu",
+      };
+    }
+  }
+  return hwInfo;
 }
 
 async function callOllama(model, messages) {
@@ -217,7 +281,19 @@ function deregister() {
 // ---------- Heartbeat ----------
 
 async function sendHeartbeat() {
-  const { util, memTotalMb } = await getGpuStats();
+  const hw = await getHardwareInfo();
+
+  // Auslastung + VRAM: auf Apple Silicon aus Unified Memory, sonst via nvidia-smi.
+  let util = 0;
+  let memTotalMb;
+  if (hw.hardware_type === "apple_silicon") {
+    memTotalMb = hw.gpu_memory_total_mb ?? CFG.gpuMemFallbackMb;
+  } else {
+    const stats = await getGpuStats();
+    util = stats.util;
+    memTotalMb = stats.memTotalMb;
+  }
+
   const tokens = tokensSinceLast;
   tokensSinceLast = 0;
   const started = Date.now();
@@ -233,6 +309,11 @@ async function sendHeartbeat() {
         latency_to_gateway_ms: Date.now() - started,
         node_software_version: CFG.version,
         endpoint_url: CFG.publicUrl,
+        // Hardware-Auto-Erkennung (Plattform übernimmt diese Werte)
+        gpu_model: hw.gpu_model,
+        gpu_count: hw.gpu_count,
+        ram_gb: hw.ram_gb,
+        hardware_type: hw.hardware_type,
       }),
       signal: AbortSignal.timeout(10_000),
     });
