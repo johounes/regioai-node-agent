@@ -113,6 +113,7 @@ function getAppleSiliconInfo() {
       gpu_model: chip || "Apple Silicon",
       gpu_count: 1,
       ram_gb: memGB,
+      unified_memory_gb: memGB,
       gpu_memory_total_mb: memGB * 1024, // Unified Memory = VRAM
       hardware_type: "apple_silicon",
     };
@@ -314,6 +315,7 @@ async function sendHeartbeat() {
         gpu_count: hw.gpu_count,
         ram_gb: hw.ram_gb,
         hardware_type: hw.hardware_type,
+        unified_memory_gb: hw.unified_memory_gb, // nur Apple Silicon, sonst undefined
       }),
       signal: AbortSignal.timeout(10_000),
     });
