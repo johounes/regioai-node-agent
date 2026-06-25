@@ -13,8 +13,14 @@
  */
 
 import { createServer } from "node:http";
-import { execFile, execSync } from "node:child_process";
-import { readFileSync, writeFileSync, existsSync, unlinkSync } from "node:fs";
+import { execFile, execSync, execFileSync } from "node:child_process";
+import {
+  readFileSync,
+  writeFileSync,
+  existsSync,
+  unlinkSync,
+  renameSync,
+} from "node:fs";
 import { hostname, totalmem } from "node:os";
 import { fileURLToPath } from "node:url";
 
@@ -34,7 +40,13 @@ const CFG = {
   heartbeatSec: Number(process.env.HEARTBEAT_INTERVAL ?? 60),
   gpuMemFallbackMb: Number(process.env.CAG_GPU_MEMORY_MB ?? 0),
   credentialsFile: process.env.CAG_CREDENTIALS_FILE ?? "./.node-credentials.json",
-  version: "0.3.0",
+  version: "0.4.0",
+  // Auto-Update: prüft regelmäßig die veröffentlichte agent.mjs und aktualisiert
+  // sich selbst. CAG_AUTO_UPDATE=false schaltet es ab.
+  autoUpdate: (process.env.CAG_AUTO_UPDATE ?? "true").toLowerCase() !== "false",
+  updateUrl:
+    process.env.CAG_UPDATE_URL ??
+    "https://raw.githubusercontent.com/johounes/regioai-node-agent/main/agent.mjs",
 };
 
 const creds = {
@@ -149,6 +161,23 @@ async function getHardwareInfo() {
   return hwInfo;
 }
 
+/** Prüft, ob Ollama erreichbar ist (GET /api/tags). Liefert {ok, models}. */
+async function pingOllama() {
+  try {
+    const res = await fetch(`${CFG.ollamaUrl}/api/tags`, {
+      signal: AbortSignal.timeout(5000),
+    });
+    if (!res.ok) return { ok: false, models: [] };
+    const data = await res.json().catch(() => ({}));
+    const models = Array.isArray(data?.models)
+      ? data.models.map((m) => m?.name).filter(Boolean)
+      : [];
+    return { ok: true, models };
+  } catch {
+    return { ok: false, models: [] };
+  }
+}
+
 async function callOllama(model, messages) {
   const res = await fetch(`${CFG.ollamaUrl}/api/chat`, {
     method: "POST",
@@ -220,7 +249,15 @@ const server = createServer(async (req, res) => {
 
     // Betriebsendpunkte
     if (req.method === "GET" && req.url === "/health") {
-      return sendJson(res, 200, { ok: true, model: CFG.model, version: CFG.version, enrolled: !!creds.nodeId });
+      const ollama = await pingOllama();
+      return sendJson(res, ollama.ok ? 200 : 503, {
+        ok: ollama.ok,
+        ollama: ollama.ok,
+        models: ollama.models,
+        model: CFG.model,
+        version: CFG.version,
+        enrolled: !!creds.nodeId,
+      });
     }
     if (req.method === "POST" && (req.url === "/v1/chat" || req.url === "/v1/swarm/forward")) {
       const body = await readBody(req);
@@ -279,6 +316,59 @@ function deregister() {
   console.log("────────────────────────────────────────────\n");
 }
 
+// ---------- Auto-Update ----------
+
+/** Vergleicht zwei "maj.min.patch"-Versionen → true, wenn a neuer als b ist. */
+function isNewerVersion(a, b) {
+  const pa = String(a).split(".").map((n) => Number(n) || 0);
+  const pb = String(b).split(".").map((n) => Number(n) || 0);
+  for (let i = 0; i < 3; i++) {
+    if ((pa[i] ?? 0) > (pb[i] ?? 0)) return true;
+    if ((pa[i] ?? 0) < (pb[i] ?? 0)) return false;
+  }
+  return false;
+}
+
+let lastUpdateCheck = 0;
+const UPDATE_CHECK_INTERVAL_MS = 3_600_000; // stündlich
+
+/**
+ * Lädt agent.mjs von `url`, vergleicht die Version und ersetzt – falls neuer als
+ * die laufende – die eigene Datei (nach Syntaxprüfung), dann process.exit(0). Der
+ * Supervisor (Docker restart:unless-stopped / macOS LaunchAgent KeepAlive) startet
+ * den Prozess mit dem neuen Code neu. Fehler sind nicht fatal.
+ */
+async function applyUpdateFrom(url) {
+  try {
+    const res = await fetch(url, { signal: AbortSignal.timeout(10_000) });
+    if (!res.ok) return;
+    const code = await res.text();
+    const m = code.match(/version:\s*"(\d+\.\d+\.\d+)"/);
+    if (!m || !isNewerVersion(m[1], CFG.version)) return;
+    // Plausibilität: keine Fehlerseite / Teil-Download einspielen
+    if (code.length < 3000 || !code.includes("sendHeartbeat")) {
+      console.warn("⚠️  Auto-Update verworfen: Remote-Datei wirkt unvollständig.");
+      return;
+    }
+    const selfPath = fileURLToPath(import.meta.url);
+    const tmp = `${selfPath}.new`;
+    writeFileSync(tmp, code);
+    // Syntaxprüfung mit demselben Node-Binary, bevor wir uns überschreiben.
+    try {
+      execFileSync(process.execPath, ["--check", tmp], { timeout: 10_000 });
+    } catch {
+      console.warn("⚠️  Auto-Update verworfen: Syntaxprüfung fehlgeschlagen.");
+      try { unlinkSync(tmp); } catch { /* ignore */ }
+      return;
+    }
+    renameSync(tmp, selfPath);
+    console.log(`⬆️  Auf Agent-Version ${m[1]} aktualisiert (war ${CFG.version}) – Neustart.`);
+    process.exit(0);
+  } catch (e) {
+    console.warn(`⚠️  Auto-Update-Check fehlgeschlagen: ${e?.message ?? e}`);
+  }
+}
+
 // ---------- Heartbeat ----------
 
 async function sendHeartbeat() {
@@ -295,15 +385,21 @@ async function sendHeartbeat() {
     memTotalMb = stats.memTotalMb;
   }
 
+  // Ollama-Gesundheit: ohne erreichbares Ollama kann der Node nicht verarbeiten
+  // → status 'degraded', damit das Gateway ihn nicht auswählt.
+  const ollama = await pingOllama();
+
   const tokens = tokensSinceLast;
   tokensSinceLast = 0;
   const started = Date.now();
+  let serverUpdate = null;
   try {
     const res = await fetch(`${CFG.gateway}/api/nodes/${creds.nodeId}/heartbeat`, {
       method: "POST",
       headers: { "Content-Type": "application/json", Authorization: `Bearer ${creds.nodeKey}` },
       body: JSON.stringify({
-        status: "online",
+        status: ollama.ok ? "online" : "degraded",
+        ollama_ok: ollama.ok,
         gpu_utilization: util,
         gpu_memory_total_mb: memTotalMb,
         tokens_processed_since_last: tokens,
@@ -325,11 +421,27 @@ async function sendHeartbeat() {
     } else if (!res.ok) {
       console.warn(`⚠️  Heartbeat abgelehnt (${res.status}): ${await res.text()}`);
     } else {
+      const data = await res.json().catch(() => ({}));
+      // Kontrollierter Rollout: { target_version, update_url } von der Plattform
+      serverUpdate = data?.update ?? null;
       console.log(`💓 Heartbeat ok – GPU ${util}%, VRAM ${memTotalMb}MB, +${tokens} Token`);
     }
   } catch (e) {
     tokensSinceLast += tokens;
     console.warn(`⚠️  Heartbeat fehlgeschlagen: ${e?.message ?? e}`);
+  }
+
+  // Auto-Update: bevorzugt die von der Plattform vorgegebene Zielversion
+  // (kontrollierter Rollout). Ohne Vorgabe Fallback: veröffentlichtes main (stündlich).
+  if (CFG.autoUpdate) {
+    if (serverUpdate?.target_version) {
+      if (isNewerVersion(serverUpdate.target_version, CFG.version)) {
+        await applyUpdateFrom(serverUpdate.update_url || CFG.updateUrl);
+      }
+    } else if (Date.now() - lastUpdateCheck > UPDATE_CHECK_INTERVAL_MS) {
+      lastUpdateCheck = Date.now();
+      await applyUpdateFrom(CFG.updateUrl);
+    }
   }
 }
 
@@ -343,10 +455,11 @@ function startHeartbeat() {
 // ---------- Start ----------
 
 server.listen(CFG.port, () => {
-  console.log(`✅ Node-Agent läuft auf :${CFG.port}`);
+  console.log(`✅ Node-Agent v${CFG.version} läuft auf :${CFG.port}`);
   console.log(`   Gateway:      ${CFG.gateway}`);
   console.log(`   Ollama:       ${CFG.ollamaUrl} (Modell ${CFG.model})`);
   console.log(`   endpoint_url: ${CFG.publicUrl}`);
+  console.log(`   Auto-Update:  ${CFG.autoUpdate ? "an (CAG_AUTO_UPDATE=false zum Abschalten)" : "aus"}`);
 
   if (!creds.nodeId || !creds.nodeKey) {
     const file = loadCredentialsFromFile();

@@ -77,6 +77,28 @@ Alle Werte werden vom Install-Skript in `~/cag-node/.env` gesetzt. Relevante Var
 | `HEARTBEAT_INTERVAL` | `60` | Heartbeat-Intervall (Sek.) |
 | `CAG_PUBLIC_URL` | `http://localhost:8080` | als `endpoint_url` gemeldete Adresse |
 | `CAG_GPU_MEMORY_MB` | `24576` | VRAM-Fallback, falls `nvidia-smi` fehlt |
+| `CAG_AUTO_UPDATE` | `true` | Self-Update an/aus (`false` = nie automatisch aktualisieren) |
+| `CAG_UPDATE_URL` | GitHub-Raw `agent.mjs` | Quelle für das Self-Update |
+
+---
+
+## Auto-Update
+
+Der Agent prüft (heartbeat-getaktet, **max. 1×/Stunde** + beim Start) die im Repo
+veröffentlichte `agent.mjs`-Version. Ist sie neuer, lädt er sie, prüft die **Syntax**
+(`node --check`) und ersetzt sich selbst, dann `exit(0)`. Der Supervisor startet den
+Prozess mit dem neuen Code neu:
+
+- **Docker:** `restart: unless-stopped` startet denselben Container neu (der überschriebene
+  `agent.mjs` bleibt im Writable-Layer erhalten).
+- **macOS:** der LaunchAgent (`KeepAlive`) startet den Prozess neu.
+
+Abschalten mit `CAG_AUTO_UPDATE=false`. So bleibt der Node ohne manuelles Redeploy aktuell.
+
+**Kontrollierter Rollout:** Setzt die Plattform `CAG_AGENT_TARGET_VERSION` (optional
+`CAG_AGENT_UPDATE_URL`), gibt sie diese **Zielversion** in der Heartbeat-Antwort mit. Der
+Agent aktualisiert sich dann auf genau diese Version (statt das veröffentlichte `main` zu
+verfolgen). So steuert der Betreiber den Rollout zentral; ohne Vorgabe gilt der `main`-Fallback.
 
 ---
 

@@ -1,0 +1,49 @@
+name: Release-Tag bei Versions-Bump
+
+# Läuft im Public-Repo johounes/regioai-node-agent. Sobald package.json eine
+# neue Version bekommt (via Sync aus dem Hauptrepo), wird ein Git-Tag + Release
+# vX.Y.Z erzeugt. So kann CAG_AGENT_UPDATE_URL auf ein getaggtes, reproduzier-
+# bares agent.mjs zeigen (statt auf bewegliches main).
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "package.json"
+      - "agent.mjs"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  tag:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Tag + Release erzeugen, falls neue Version
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          VERSION=$(node -p "require('./package.json').version")
+          TAG="v${VERSION}"
+
+          if git rev-parse "$TAG" >/dev/null 2>&1; then
+            echo "ℹ️  Tag $TAG existiert bereits – nichts zu tun."
+            exit 0
+          fi
+
+          # Konsistenzcheck: agent.mjs-Version sollte zur package.json passen.
+          AGENT_VER=$(grep -oE 'version:[[:space:]]*"[0-9]+\.[0-9]+\.[0-9]+"' agent.mjs \
+            | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1 || true)
+          if [ -n "$AGENT_VER" ] && [ "$AGENT_VER" != "$VERSION" ]; then
+            echo "⚠️  agent.mjs ($AGENT_VER) != package.json ($VERSION) – Tag folgt package.json."
+          fi
+
+          gh release create "$TAG" --title "$TAG" --generate-notes --target "$GITHUB_SHA"
+          echo "✅ Release $TAG erstellt → agent.mjs unter raw .../$TAG/agent.mjs erreichbar."

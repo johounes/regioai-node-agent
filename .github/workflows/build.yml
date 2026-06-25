@@ -28,6 +28,10 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Version aus package.json lesen
+        id: meta
+        run: echo "version=$(node -p "require('./package.json').version")" >> "$GITHUB_OUTPUT"
+
       - name: Build and Push
         uses: docker/build-push-action@v5
         with:
@@ -36,5 +40,6 @@ jobs:
           push: true
           tags: |
             ghcr.io/johounes/regioai-node-agent:latest
+            ghcr.io/johounes/regioai-node-agent:v${{ steps.meta.outputs.version }}
             ghcr.io/johounes/regioai-node-agent:sha-${{ github.sha }}
 
