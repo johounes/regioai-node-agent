@@ -40,7 +40,7 @@ const CFG = {
   heartbeatSec: Number(process.env.HEARTBEAT_INTERVAL ?? 60),
   gpuMemFallbackMb: Number(process.env.CAG_GPU_MEMORY_MB ?? 0),
   credentialsFile: process.env.CAG_CREDENTIALS_FILE ?? "./.node-credentials.json",
-  version: "0.5.2",
+  version: "0.5.3",
   // Ollama-Generierung: Kontextfenster + max. Output-Token. Ohne diese Werte
   // greift ein Default, der lange Antworten abschneidet.
   numCtx: Number(process.env.CAG_NUM_CTX ?? 8192),
@@ -180,6 +180,70 @@ async function pingOllama() {
   } catch {
     return { ok: false, models: [] };
   }
+}
+
+// ---------- Modell-Distribution ----------
+
+let pullingModel = null;
+let pullProgress = 0;
+
+/**
+ * Zieht ein Modell per Ollama /api/pull (streamt Fortschritt). Läuft async im
+ * Hintergrund; pullingModel/pullProgress werden im Heartbeat mitgemeldet.
+ */
+async function pullModel(name) {
+  if (pullingModel) return; // immer nur ein Pull gleichzeitig
+  pullingModel = name;
+  pullProgress = 0;
+  console.log(`⬇️  Ziehe Modell ${name} ...`);
+  try {
+    const res = await fetch(`${CFG.ollamaUrl}/api/pull`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name, stream: true }),
+      signal: AbortSignal.timeout(3_600_000), // bis 1h für große Modelle
+    });
+    if (!res.ok || !res.body) throw new Error(`Ollama pull ${res.status}`);
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let buf = "";
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buf += decoder.decode(value, { stream: true });
+      let nl;
+      while ((nl = buf.indexOf("\n")) >= 0) {
+        const line = buf.slice(0, nl).trim();
+        buf = buf.slice(nl + 1);
+        if (!line) continue;
+        try {
+          const o = JSON.parse(line);
+          if (o.total && o.completed) {
+            pullProgress = Math.round((o.completed / o.total) * 100);
+          }
+          if (o.status === "success") pullProgress = 100;
+          if (o.error) throw new Error(o.error);
+        } catch {
+          /* unvollständige Zeile */
+        }
+      }
+    }
+    console.log(`✅ Modell ${name} installiert.`);
+  } catch (e) {
+    console.warn(`⚠️  Modell-Pull ${name} fehlgeschlagen: ${e?.message ?? e}`);
+  } finally {
+    pullingModel = null;
+    pullProgress = 0;
+  }
+}
+
+/** Zieht das erste fehlende Soll-Modell (eines nach dem anderen). */
+function reconcileModels(desired, installed) {
+  if (!Array.isArray(desired) || pullingModel) return;
+  const missing = desired.find(
+    (m) => typeof m === "string" && m && !installed.includes(m),
+  );
+  if (missing) pullModel(missing); // fire-and-forget
 }
 
 async function callOllama(model, messages) {
@@ -495,6 +559,10 @@ async function sendHeartbeat() {
         ram_gb: hw.ram_gb,
         hardware_type: hw.hardware_type,
         unified_memory_gb: hw.unified_memory_gb, // nur Apple Silicon, sonst undefined
+        // Modell-Distribution: installierte Modelle + laufender Pull
+        installed_models: ollama.models,
+        pulling_model: pullingModel,
+        pull_progress: pullProgress,
       }),
       signal: AbortSignal.timeout(10_000),
     });
@@ -507,6 +575,8 @@ async function sendHeartbeat() {
       const data = await res.json().catch(() => ({}));
       // Kontrollierter Rollout: { target_version, update_url } von der Plattform
       serverUpdate = data?.update ?? null;
+      // Modell-Distribution: fehlende Soll-Modelle ziehen
+      reconcileModels(data?.desired_models, ollama.models);
       console.log(`💓 Heartbeat ok – GPU ${util}%, VRAM ${memTotalMb}MB, +${tokens} Token`);
     }
   } catch (e) {
