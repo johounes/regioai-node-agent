@@ -40,7 +40,7 @@ const CFG = {
   heartbeatSec: Number(process.env.HEARTBEAT_INTERVAL ?? 60),
   gpuMemFallbackMb: Number(process.env.CAG_GPU_MEMORY_MB ?? 0),
   credentialsFile: process.env.CAG_CREDENTIALS_FILE ?? "./.node-credentials.json",
-  version: "0.5.0",
+  version: "0.5.1",
   // Auto-Update: prüft regelmäßig die veröffentlichte agent.mjs und aktualisiert
   // sich selbst. CAG_AUTO_UPDATE=false schaltet es ab.
   autoUpdate: (process.env.CAG_AUTO_UPDATE ?? "true").toLowerCase() !== "false",
@@ -418,7 +418,9 @@ async function applyUpdateFrom(url) {
       return;
     }
     const selfPath = fileURLToPath(import.meta.url);
-    const tmp = `${selfPath}.new`;
+    // Temp-Datei MUSS auf .mjs enden, sonst scheitert `node --check`
+    // (ERR_UNKNOWN_FILE_EXTENSION für .new → Modulformat unbekannt).
+    const tmp = `${selfPath}.new.mjs`;
     writeFileSync(tmp, code);
     // Syntaxprüfung mit demselben Node-Binary, bevor wir uns überschreiben.
     try {
