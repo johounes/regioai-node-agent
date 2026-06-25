@@ -40,7 +40,7 @@ const CFG = {
   heartbeatSec: Number(process.env.HEARTBEAT_INTERVAL ?? 60),
   gpuMemFallbackMb: Number(process.env.CAG_GPU_MEMORY_MB ?? 0),
   credentialsFile: process.env.CAG_CREDENTIALS_FILE ?? "./.node-credentials.json",
-  version: "0.4.0",
+  version: "0.5.0",
   // Auto-Update: prüft regelmäßig die veröffentlichte agent.mjs und aktualisiert
   // sich selbst. CAG_AUTO_UPDATE=false schaltet es ab.
   autoUpdate: (process.env.CAG_AUTO_UPDATE ?? "true").toLowerCase() !== "false",
@@ -194,6 +194,70 @@ async function callOllama(model, messages) {
   return { message: { content }, eval_count: outTokens, prompt_eval_count: inTokens };
 }
 
+/**
+ * Echtes Token-Streaming: ruft Ollama mit stream:true auf und reicht die
+ * NDJSON-Zeilen sofort an den Aufrufer (Gateway) durch. So erscheint das erste
+ * Token nach ~1 s statt nach der kompletten Generierung. Token werden aus der
+ * abschließenden `done`-Zeile gezählt.
+ */
+async function streamOllama(res, model, messages) {
+  const upstream = await fetch(`${CFG.ollamaUrl}/api/chat`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ model: model || CFG.model, messages, stream: true }),
+    signal: AbortSignal.timeout(180_000),
+  });
+  if (!upstream.ok || !upstream.body) {
+    sendJson(res, 502, { error: `Ollama antwortete mit ${upstream.status}` });
+    return;
+  }
+  res.writeHead(200, {
+    "Content-Type": "application/x-ndjson",
+    "Cache-Control": "no-cache",
+  });
+  const reader = upstream.body.getReader();
+  const decoder = new TextDecoder();
+  let buf = "";
+  let inTok = 0;
+  let outTok = 0;
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    const chunk = decoder.decode(value, { stream: true });
+    res.write(chunk); // NDJSON sofort durchreichen
+    buf += chunk;
+    let nl;
+    while ((nl = buf.indexOf("\n")) >= 0) {
+      const line = buf.slice(0, nl).trim();
+      buf = buf.slice(nl + 1);
+      if (!line) continue;
+      try {
+        const o = JSON.parse(line);
+        if (o.done) {
+          outTok = Number(o.eval_count ?? 0);
+          inTok = Number(o.prompt_eval_count ?? 0);
+        }
+      } catch {
+        /* unvollständige Zeile – ignorieren */
+      }
+    }
+  }
+  const tail = buf.trim();
+  if (tail) {
+    try {
+      const o = JSON.parse(tail);
+      if (o.done) {
+        outTok = Number(o.eval_count ?? 0);
+        inTok = Number(o.prompt_eval_count ?? 0);
+      }
+    } catch {
+      /* unvollständig – ignorieren */
+    }
+  }
+  res.end();
+  tokensSinceLast += outTok + inTok;
+}
+
 // ---------- HTTP ----------
 
 function sendJson(res, status, obj) {
@@ -261,6 +325,9 @@ const server = createServer(async (req, res) => {
     }
     if (req.method === "POST" && (req.url === "/v1/chat" || req.url === "/v1/swarm/forward")) {
       const body = await readBody(req);
+      if (body.stream === true) {
+        return await streamOllama(res, body.model, body.messages ?? []);
+      }
       return sendJson(res, 200, await callOllama(body.model, body.messages ?? []));
     }
     sendJson(res, 404, { error: "Not found" });
