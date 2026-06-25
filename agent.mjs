@@ -40,7 +40,11 @@ const CFG = {
   heartbeatSec: Number(process.env.HEARTBEAT_INTERVAL ?? 60),
   gpuMemFallbackMb: Number(process.env.CAG_GPU_MEMORY_MB ?? 0),
   credentialsFile: process.env.CAG_CREDENTIALS_FILE ?? "./.node-credentials.json",
-  version: "0.5.1",
+  version: "0.5.2",
+  // Ollama-Generierung: Kontextfenster + max. Output-Token. Ohne diese Werte
+  // greift ein Default, der lange Antworten abschneidet.
+  numCtx: Number(process.env.CAG_NUM_CTX ?? 8192),
+  numPredict: Number(process.env.CAG_NUM_PREDICT ?? 2048),
   // Auto-Update: prüft regelmäßig die veröffentlichte agent.mjs und aktualisiert
   // sich selbst. CAG_AUTO_UPDATE=false schaltet es ab.
   autoUpdate: (process.env.CAG_AUTO_UPDATE ?? "true").toLowerCase() !== "false",
@@ -182,7 +186,12 @@ async function callOllama(model, messages) {
   const res = await fetch(`${CFG.ollamaUrl}/api/chat`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ model: model || CFG.model, messages, stream: false }),
+    body: JSON.stringify({
+      model: model || CFG.model,
+      messages,
+      stream: false,
+      options: { num_ctx: CFG.numCtx, num_predict: CFG.numPredict },
+    }),
     signal: AbortSignal.timeout(120_000),
   });
   if (!res.ok) throw new Error(`Ollama antwortete mit ${res.status}: ${await res.text()}`);
@@ -204,7 +213,12 @@ async function streamOllama(res, model, messages) {
   const upstream = await fetch(`${CFG.ollamaUrl}/api/chat`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ model: model || CFG.model, messages, stream: true }),
+    body: JSON.stringify({
+      model: model || CFG.model,
+      messages,
+      stream: true,
+      options: { num_ctx: CFG.numCtx, num_predict: CFG.numPredict },
+    }),
     signal: AbortSignal.timeout(180_000),
   });
   if (!upstream.ok || !upstream.body) {
