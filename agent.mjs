@@ -40,11 +40,14 @@ const CFG = {
   heartbeatSec: Number(process.env.HEARTBEAT_INTERVAL ?? 60),
   gpuMemFallbackMb: Number(process.env.CAG_GPU_MEMORY_MB ?? 0),
   credentialsFile: process.env.CAG_CREDENTIALS_FILE ?? "./.node-credentials.json",
-  version: "0.5.4",
+  version: "0.5.5",
   // Ollama-Generierung: Kontextfenster + max. Output-Token. Ohne diese Werte
   // greift ein Default, der lange Antworten abschneidet.
   numCtx: Number(process.env.CAG_NUM_CTX ?? 8192),
   numPredict: Number(process.env.CAG_NUM_PREDICT ?? 2048),
+  // Modell im VRAM halten → kein mehrsekündiger Reload nach Leerlauf.
+  // "-1" = dauerhaft geladen (für dedizierte Inferenz-Nodes ideal), "30m" etc.
+  keepAlive: process.env.CAG_KEEP_ALIVE ?? "30m",
   // Auto-Update: prüft regelmäßig die veröffentlichte agent.mjs und aktualisiert
   // sich selbst. CAG_AUTO_UPDATE=false schaltet es ab.
   autoUpdate: (process.env.CAG_AUTO_UPDATE ?? "true").toLowerCase() !== "false",
@@ -254,6 +257,7 @@ async function callOllama(model, messages) {
       model: model || CFG.model,
       messages,
       stream: false,
+      keep_alive: CFG.keepAlive,
       options: { num_ctx: CFG.numCtx, num_predict: CFG.numPredict },
     }),
     signal: AbortSignal.timeout(120_000),
@@ -281,6 +285,7 @@ async function streamOllama(res, model, messages, tools) {
       model: model || CFG.model,
       messages,
       stream: true,
+      keep_alive: CFG.keepAlive,
       options: { num_ctx: CFG.numCtx, num_predict: CFG.numPredict },
       // Tool-Calling (Web-Suche): nur durchreichen, wenn das Gateway Tools sendet.
       ...(Array.isArray(tools) && tools.length ? { tools } : {}),
