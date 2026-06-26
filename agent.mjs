@@ -40,7 +40,7 @@ const CFG = {
   heartbeatSec: Number(process.env.HEARTBEAT_INTERVAL ?? 60),
   gpuMemFallbackMb: Number(process.env.CAG_GPU_MEMORY_MB ?? 0),
   credentialsFile: process.env.CAG_CREDENTIALS_FILE ?? "./.node-credentials.json",
-  version: "0.5.3",
+  version: "0.5.4",
   // Ollama-Generierung: Kontextfenster + max. Output-Token. Ohne diese Werte
   // greift ein Default, der lange Antworten abschneidet.
   numCtx: Number(process.env.CAG_NUM_CTX ?? 8192),
@@ -273,7 +273,7 @@ async function callOllama(model, messages) {
  * Token nach ~1 s statt nach der kompletten Generierung. Token werden aus der
  * abschließenden `done`-Zeile gezählt.
  */
-async function streamOllama(res, model, messages) {
+async function streamOllama(res, model, messages, tools) {
   const upstream = await fetch(`${CFG.ollamaUrl}/api/chat`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -282,6 +282,8 @@ async function streamOllama(res, model, messages) {
       messages,
       stream: true,
       options: { num_ctx: CFG.numCtx, num_predict: CFG.numPredict },
+      // Tool-Calling (Web-Suche): nur durchreichen, wenn das Gateway Tools sendet.
+      ...(Array.isArray(tools) && tools.length ? { tools } : {}),
     }),
     signal: AbortSignal.timeout(180_000),
   });
@@ -404,7 +406,12 @@ const server = createServer(async (req, res) => {
     if (req.method === "POST" && (req.url === "/v1/chat" || req.url === "/v1/swarm/forward")) {
       const body = await readBody(req);
       if (body.stream === true) {
-        return await streamOllama(res, body.model, body.messages ?? []);
+        return await streamOllama(
+          res,
+          body.model,
+          body.messages ?? [],
+          body.tools,
+        );
       }
       return sendJson(res, 200, await callOllama(body.model, body.messages ?? []));
     }
