@@ -41,7 +41,7 @@ const CFG = {
   heartbeatSec: Number(process.env.HEARTBEAT_INTERVAL ?? 60),
   gpuMemFallbackMb: Number(process.env.CAG_GPU_MEMORY_MB ?? 0),
   credentialsFile: process.env.CAG_CREDENTIALS_FILE ?? "./.node-credentials.json",
-  version: "0.6.0",
+  version: "0.6.1",
   // Ollama-Generierung: Kontextfenster + max. Output-Token. Ohne diese Werte
   // greift ein Default, der lange Antworten abschneidet.
   numCtx: Number(process.env.CAG_NUM_CTX ?? 8192),
@@ -257,6 +257,38 @@ function reconcileModels(desired, installed) {
     (m) => typeof m === "string" && m && !installed.includes(m),
   );
   if (missing) pullModel(missing); // fire-and-forget
+}
+
+/**
+ * Entlädt alle aktuell in Ollama geladenen Modelle (keep_alive: 0) → gibt VRAM
+ * frei. Wird vom Admin über das Heartbeat-Signal { unload: true } ausgelöst.
+ */
+async function unloadModels() {
+  try {
+    const ps = await fetch(`${CFG.ollamaUrl}/api/ps`, {
+      signal: AbortSignal.timeout(5000),
+    })
+      .then((r) => r.json())
+      .catch(() => ({}));
+    const loaded = Array.isArray(ps?.models)
+      ? ps.models.map((m) => m?.name || m?.model).filter(Boolean)
+      : [];
+    for (const model of loaded) {
+      await fetch(`${CFG.ollamaUrl}/api/generate`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ model, keep_alive: 0 }),
+        signal: AbortSignal.timeout(10_000),
+      }).catch(() => {});
+    }
+    console.log(
+      loaded.length
+        ? `⏏️  Modell(e) entladen: ${loaded.join(", ")}`
+        : "⏏️  Entladen angefordert – kein Modell geladen.",
+    );
+  } catch (e) {
+    console.warn(`⚠️  Entladen fehlgeschlagen: ${e?.message ?? e}`);
+  }
 }
 
 async function callOllama(model, messages) {
@@ -657,6 +689,8 @@ async function sendHeartbeat() {
       serverUpdate = data?.update ?? null;
       // Modell-Distribution: fehlende Soll-Modelle ziehen
       reconcileModels(data?.desired_models, ollama.models);
+      // Manuelles Entladen (Admin) – gibt VRAM frei
+      if (data?.unload) unloadModels(); // fire-and-forget
       console.log(`💓 Heartbeat ok – GPU ${util}%, VRAM ${memTotalMb}MB, +${tokens} Token`);
     }
   } catch (e) {
