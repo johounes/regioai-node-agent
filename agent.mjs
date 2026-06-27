@@ -41,7 +41,7 @@ const CFG = {
   heartbeatSec: Number(process.env.HEARTBEAT_INTERVAL ?? 60),
   gpuMemFallbackMb: Number(process.env.CAG_GPU_MEMORY_MB ?? 0),
   credentialsFile: process.env.CAG_CREDENTIALS_FILE ?? "./.node-credentials.json",
-  version: "0.6.1",
+  version: "0.6.2",
   // Ollama-Generierung: Kontextfenster + max. Output-Token. Ohne diese Werte
   // greift ein Default, der lange Antworten abschneidet.
   numCtx: Number(process.env.CAG_NUM_CTX ?? 8192),
@@ -193,6 +193,37 @@ async function pingOllama() {
   } catch {
     return { ok: false, models: [] };
   }
+}
+
+// Cache: Modellname → unterstützt Tools? (Capabilities ändern sich nicht.)
+const toolCapCache = new Map();
+
+/**
+ * Ermittelt die tool-fähigen Modelle (Ollama /api/show → capabilities "tools").
+ * Pro Modell gecacht – nur neue Modelle werden abgefragt. So muss die Plattform
+ * nicht mehr anhand einer Modell-Liste raten.
+ */
+async function getToolModels(installed) {
+  const out = [];
+  for (const model of installed) {
+    if (!toolCapCache.has(model)) {
+      try {
+        const res = await fetch(`${CFG.ollamaUrl}/api/show`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ model }),
+          signal: AbortSignal.timeout(5000),
+        });
+        const data = await res.json().catch(() => ({}));
+        const caps = Array.isArray(data?.capabilities) ? data.capabilities : [];
+        toolCapCache.set(model, caps.includes("tools"));
+      } catch {
+        continue; // Fehler nicht cachen → nächste Runde erneut
+      }
+    }
+    if (toolCapCache.get(model)) out.push(model);
+  }
+  return out;
 }
 
 // ---------- Modell-Distribution ----------
@@ -647,6 +678,8 @@ async function sendHeartbeat() {
   // Ollama-Gesundheit: ohne erreichbares Ollama kann der Node nicht verarbeiten
   // → status 'degraded', damit das Gateway ihn nicht auswählt.
   const ollama = await pingOllama();
+  // Tool-fähige Modelle (gecacht) – die Plattform nutzt das autoritativ.
+  const toolModels = ollama.ok ? await getToolModels(ollama.models) : [];
 
   const tokens = tokensSinceLast;
   tokensSinceLast = 0;
@@ -673,6 +706,7 @@ async function sendHeartbeat() {
         unified_memory_gb: hw.unified_memory_gb, // nur Apple Silicon, sonst undefined
         // Modell-Distribution: installierte Modelle + laufender Pull
         installed_models: ollama.models,
+        tool_models: toolModels,
         pulling_model: pullingModel,
         pull_progress: pullProgress,
       }),
