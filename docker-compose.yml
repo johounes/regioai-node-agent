@@ -18,6 +18,10 @@ services:
     image: ollama/ollama:latest
     restart: unless-stopped
     network_mode: host
+    environment:
+      # Immer nur EIN Modell im Speicher (neues verdrängt das alte).
+      - OLLAMA_MAX_LOADED_MODELS=1
+      - OLLAMA_KEEP_ALIVE=30m
     volumes:
       - ollama:/root/.ollama
     # GPU-Zugriff (benötigt NVIDIA Container Toolkit)
