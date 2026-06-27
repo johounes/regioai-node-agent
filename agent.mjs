@@ -41,7 +41,7 @@ const CFG = {
   heartbeatSec: Number(process.env.HEARTBEAT_INTERVAL ?? 60),
   gpuMemFallbackMb: Number(process.env.CAG_GPU_MEMORY_MB ?? 0),
   credentialsFile: process.env.CAG_CREDENTIALS_FILE ?? "./.node-credentials.json",
-  version: "0.6.2",
+  version: "0.6.3",
   // Ollama-Generierung: Kontextfenster + max. Output-Token. Ohne diese Werte
   // greift ein Default, der lange Antworten abschneidet.
   numCtx: Number(process.env.CAG_NUM_CTX ?? 8192),
@@ -319,6 +319,28 @@ async function unloadModels() {
     );
   } catch (e) {
     console.warn(`⚠️  Entladen fehlgeschlagen: ${e?.message ?? e}`);
+  }
+}
+
+/**
+ * Löscht Modelle endgültig aus Ollama (Disk freigeben). Wird vom Admin über das
+ * Heartbeat-Signal { delete_models: [...] } ausgelöst.
+ */
+async function deleteModels(models) {
+  for (const model of models) {
+    if (typeof model !== "string" || !model) continue;
+    try {
+      await fetch(`${CFG.ollamaUrl}/api/delete`, {
+        method: "DELETE",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ name: model, model }),
+        signal: AbortSignal.timeout(10_000),
+      });
+      toolCapCache.delete(model);
+      console.log(`🗑️  Modell gelöscht: ${model}`);
+    } catch (e) {
+      console.warn(`⚠️  Löschen fehlgeschlagen (${model}): ${e?.message ?? e}`);
+    }
   }
 }
 
@@ -725,6 +747,9 @@ async function sendHeartbeat() {
       reconcileModels(data?.desired_models, ollama.models);
       // Manuelles Entladen (Admin) – gibt VRAM frei
       if (data?.unload) unloadModels(); // fire-and-forget
+      // Manuelles Löschen (Admin) – gibt Disk frei
+      if (Array.isArray(data?.delete_models) && data.delete_models.length)
+        deleteModels(data.delete_models); // fire-and-forget
       console.log(`💓 Heartbeat ok – GPU ${util}%, VRAM ${memTotalMb}MB, +${tokens} Token`);
     }
   } catch (e) {
