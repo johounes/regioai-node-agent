@@ -41,9 +41,15 @@ const CFG = {
   heartbeatSec: Number(process.env.HEARTBEAT_INTERVAL ?? 60),
   gpuMemFallbackMb: Number(process.env.CAG_GPU_MEMORY_MB ?? 0),
   credentialsFile: process.env.CAG_CREDENTIALS_FILE ?? "./.node-credentials.json",
+  // Persistenter Zustand (z. B. Pause) – übersteht Neustarts.
+  stateFile: process.env.CAG_STATE_FILE ?? "./.node-state.json",
+  // Lokaler Control-Server (Pause/Resume) – NUR localhost, NICHT über den Tunnel
+  // erreichbar (sonst könnte jeder die Node aus dem Netz pausieren).
+  controlPort: Number(process.env.CAG_CONTROL_PORT ?? (Number(process.env.PORT ?? 8088) + 1)),
+  controlBind: process.env.CAG_CONTROL_BIND ?? "127.0.0.1",
   // Pfad zur Ollama-Log-Datei (von den Installern gesetzt). Leer = nur Agent-Logs.
   ollamaLog: process.env.CAG_OLLAMA_LOG ?? "",
-  version: "0.6.5",
+  version: "0.6.6",
   // Ollama-Generierung: Kontextfenster + max. Output-Token. Ohne diese Werte
   // greift ein Default, der lange Antworten abschneidet.
   numCtx: Number(process.env.CAG_NUM_CTX ?? 8192),
@@ -76,6 +82,40 @@ const creds = {
 let tokensSinceLast = 0;
 let heartbeatStarted = false;
 let heartbeatTimer = null;
+
+// ---------- Pause-Zustand (Operator pausiert die Node lokal) ----------
+// Pausiert = Modell entladen, Inferenz abgelehnt, Heartbeat meldet 'paused' (=
+// kein Routing). Heartbeat läuft weiter, damit Fortsetzen auch remote ginge.
+let paused = false;
+try {
+  if (existsSync(CFG.stateFile)) {
+    paused = JSON.parse(readFileSync(CFG.stateFile, "utf8"))?.paused === true;
+  }
+} catch {
+  /* kein/kaputter State – als nicht pausiert starten */
+}
+
+function persistState() {
+  try {
+    writeFileSync(CFG.stateFile, JSON.stringify({ paused }, null, 2));
+  } catch (e) {
+    console.warn(`⚠️  Konnte State nicht speichern: ${e?.message ?? e}`);
+  }
+}
+
+/** Setzt den Pause-Zustand, entlädt beim Pausieren das Modell, persistiert. */
+function setPaused(value) {
+  const next = value === true;
+  if (next === paused) return;
+  paused = next;
+  persistState();
+  if (paused) {
+    console.log("⏸️  Node pausiert – entlade Modell, lehne Inferenz ab.");
+    unloadModels(); // gibt VRAM frei – fire-and-forget
+  } else {
+    console.log("▶️  Node fortgesetzt – wieder verfügbar.");
+  }
+}
 
 // ---------- Log-Puffer (für „Logs anfordern" im Dashboard) ----------
 let logsRequested = false;
@@ -547,6 +587,18 @@ const server = createServer(async (req, res) => {
       return sendJson(res, 200, { ok: true });
     }
 
+    // Pausiert → Inferenz ablehnen (das Gateway routet ohnehin nicht, dies fängt
+    // direkte/in-flight Aufrufe ab und stellt sicher, dass kein GPU-Job startet).
+    if (
+      paused &&
+      req.method === "POST" &&
+      (req.url === "/v1/chat" ||
+        req.url === "/v1/swarm/forward" ||
+        req.url === "/v1/embed")
+    ) {
+      return sendJson(res, 503, { error: "Node pausiert", paused: true });
+    }
+
     // Betriebsendpunkte
     if (req.method === "GET" && req.url === "/health") {
       const ollama = await pingOllama();
@@ -776,7 +828,7 @@ async function sendHeartbeat() {
       method: "POST",
       headers: { "Content-Type": "application/json", Authorization: `Bearer ${creds.nodeKey}` },
       body: JSON.stringify({
-        status: ollama.ok ? "online" : "degraded",
+        status: paused ? "paused" : ollama.ok ? "online" : "degraded",
         ollama_ok: ollama.ok,
         gpu_utilization: util,
         gpu_memory_total_mb: memTotalMb,
@@ -808,8 +860,9 @@ async function sendHeartbeat() {
       const data = await res.json().catch(() => ({}));
       // Kontrollierter Rollout: { target_version, update_url } von der Plattform
       serverUpdate = data?.update ?? null;
-      // Modell-Distribution: fehlende Soll-Modelle ziehen
-      reconcileModels(data?.desired_models, ollama.models);
+      // Modell-Distribution: fehlende Soll-Modelle ziehen (nicht während Pause –
+      // sonst würde das Pausieren durch einen Pull konterkariert).
+      if (!paused) reconcileModels(data?.desired_models, ollama.models);
       // Manuelles Entladen (Admin) – gibt VRAM frei
       if (data?.unload) unloadModels(); // fire-and-forget
       // Manuelles Löschen (Admin) – gibt Disk frei
@@ -848,6 +901,68 @@ function startHeartbeat() {
   sendHeartbeat();
   heartbeatTimer = setInterval(sendHeartbeat, CFG.heartbeatSec * 1000);
 }
+
+// ---------- Lokale Steuerung (Pause/Resume) ----------
+// Eigener Server, gebunden an localhost (controlBind) und NICHT über den Tunnel
+// erreichbar. Hier hängt sich später das Tray-Icon dran (gleiche Endpunkte).
+
+const CONTROL_HTML = `<!doctype html><html lang="de"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1"><title>ProximaEU Node</title>
+<style>body{font-family:system-ui,-apple-system,sans-serif;background:#0f172a;color:#e2e8f0;
+display:flex;min-height:100vh;align-items:center;justify-content:center;margin:0}
+.card{background:#1e293b;border-radius:16px;padding:32px;width:320px;text-align:center;
+box-shadow:0 10px 40px rgba(0,0,0,.4)}h1{font-size:18px;margin:0 0 4px}
+.sub{color:#94a3b8;font-size:13px;margin-bottom:22px}.dot{display:inline-block;width:10px;
+height:10px;border-radius:50%;margin-right:7px}.state{font-weight:600;font-size:15px;margin-bottom:22px}
+button{width:100%;padding:13px;border:0;border-radius:10px;font-size:15px;font-weight:600;cursor:pointer}
+.pause{background:#f59e0b;color:#1e293b}.resume{background:#10b981;color:#06281c}
+button:disabled{opacity:.5;cursor:default}.hint{color:#64748b;font-size:11px;margin-top:16px}</style>
+</head><body><div class="card"><h1>ProximaEU Node</h1><div class="sub">Lokale Steuerung</div>
+<div class="state" id="state">…</div><button id="btn" disabled>…</button>
+<div class="hint">Pausieren entlädt das Modell und gibt deine GPU frei.</div>
+<script>
+async function refresh(){try{const d=await (await fetch('/status')).json();render(d.paused)}catch(e){}}
+function render(p){const s=document.getElementById('state'),b=document.getElementById('btn');
+s.innerHTML='<span class="dot" style="background:'+(p?'#f59e0b':'#10b981')+'"></span>'+(p?'Pausiert':'Aktiv – verfügbar');
+b.textContent=p?'▶ Fortsetzen':'⏸ Pausieren';b.className=p?'resume':'pause';b.disabled=false;
+b.onclick=async()=>{b.disabled=true;await fetch(p?'/resume':'/pause',{method:'POST'});setTimeout(refresh,400)}}
+refresh();setInterval(refresh,5000);
+</script></div></body></html>`;
+
+const controlServer = createServer(async (req, res) => {
+  try {
+    if (req.method === "GET" && req.url === "/") {
+      res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
+      return res.end(CONTROL_HTML);
+    }
+    if (req.method === "GET" && req.url === "/status") {
+      return sendJson(res, 200, {
+        paused,
+        version: CFG.version,
+        enrolled: !!(creds.nodeId && creds.nodeKey),
+      });
+    }
+    if (req.method === "POST" && req.url === "/pause") {
+      setPaused(true);
+      return sendJson(res, 200, { paused });
+    }
+    if (req.method === "POST" && req.url === "/resume") {
+      setPaused(false);
+      return sendJson(res, 200, { paused });
+    }
+    sendJson(res, 404, { error: "Not found" });
+  } catch (e) {
+    sendJson(res, 500, { error: String(e?.message ?? e) });
+  }
+});
+
+controlServer.listen(CFG.controlPort, CFG.controlBind, () => {
+  console.log(
+    `🎛️  Lokale Steuerung: http://127.0.0.1:${CFG.controlPort} (Pause/Resume)`,
+  );
+  if (paused)
+    console.log("⏸️  Node startet PAUSIERT (gespeicherter Zustand) – Fortsetzen über die Steuerung.");
+});
 
 // ---------- Start ----------
 
