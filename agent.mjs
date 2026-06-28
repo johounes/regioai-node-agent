@@ -43,7 +43,7 @@ const CFG = {
   credentialsFile: process.env.CAG_CREDENTIALS_FILE ?? "./.node-credentials.json",
   // Pfad zur Ollama-Log-Datei (von den Installern gesetzt). Leer = nur Agent-Logs.
   ollamaLog: process.env.CAG_OLLAMA_LOG ?? "",
-  version: "0.6.4",
+  version: "0.6.5",
   // Ollama-Generierung: Kontextfenster + max. Output-Token. Ohne diese Werte
   // greift ein Default, der lange Antworten abschneidet.
   numCtx: Number(process.env.CAG_NUM_CTX ?? 8192),
@@ -411,6 +411,23 @@ async function callOllama(model, messages) {
  * Token nach ~1 s statt nach der kompletten Generierung. Token werden aus der
  * abschließenden `done`-Zeile gezählt.
  */
+/** Embeddings via Ollama (/api/embed). input = String oder String[]. */
+async function embedOllama(model, input) {
+  try {
+    const upstream = await fetch(`${CFG.ollamaUrl}/api/embed`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ model: model || "nomic-embed-text", input }),
+      signal: AbortSignal.timeout(30_000),
+    });
+    if (!upstream.ok) return { error: `Ollama embed ${upstream.status}` };
+    const data = await upstream.json().catch(() => ({}));
+    return { embeddings: Array.isArray(data?.embeddings) ? data.embeddings : [] };
+  } catch (e) {
+    return { error: String(e?.message ?? e) };
+  }
+}
+
 async function streamOllama(res, model, messages, tools) {
   const upstream = await fetch(`${CFG.ollamaUrl}/api/chat`, {
     method: "POST",
@@ -553,6 +570,11 @@ const server = createServer(async (req, res) => {
         );
       }
       return sendJson(res, 200, await callOllama(body.model, body.messages ?? []));
+    }
+    // Embeddings (RAG): das Gateway bettet Doku-Chunks/Fragen hier ein.
+    if (req.method === "POST" && req.url === "/v1/embed") {
+      const body = await readBody(req);
+      return sendJson(res, 200, await embedOllama(body.model, body.input));
     }
     sendJson(res, 404, { error: "Not found" });
   } catch (e) {

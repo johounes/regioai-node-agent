@@ -1,6 +1,6 @@
 {
   "name": "cag-node-agent",
-  "version": "0.6.4",
+  "version": "0.6.5",
   "private": true,
   "type": "module",
   "description": "Community AI Grid – Node-Agent (wraps Ollama, sends heartbeats)",
