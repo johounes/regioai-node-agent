@@ -1,6 +1,6 @@
-# Community AI Grid – Node-Agent
+# ProximaEU – Node-Agent
 
-Die **Node-Software** von [Community AI Grid](https://regio-ai.vercel.app).
+Die **Node-Software** von [ProximaEU](https://regio-ai.vercel.app).
 Sie läuft auf deinem GPU-Rechner, umschließt [Ollama](https://ollama.com) und
 verbindet deine Maschine mit der Plattform:
 
@@ -132,4 +132,4 @@ curl http://localhost:8080/health
 
 ## Lizenz & Plattform
 
-Teil von **Community AI Grid** · https://regio-ai.vercel.app
+Teil von **ProximaEU** · https://regio-ai.vercel.app

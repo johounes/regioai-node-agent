@@ -41,7 +41,9 @@ const CFG = {
   heartbeatSec: Number(process.env.HEARTBEAT_INTERVAL ?? 60),
   gpuMemFallbackMb: Number(process.env.CAG_GPU_MEMORY_MB ?? 0),
   credentialsFile: process.env.CAG_CREDENTIALS_FILE ?? "./.node-credentials.json",
-  version: "0.6.3",
+  // Pfad zur Ollama-Log-Datei (von den Installern gesetzt). Leer = nur Agent-Logs.
+  ollamaLog: process.env.CAG_OLLAMA_LOG ?? "",
+  version: "0.6.4",
   // Ollama-Generierung: Kontextfenster + max. Output-Token. Ohne diese Werte
   // greift ein Default, der lange Antworten abschneidet.
   numCtx: Number(process.env.CAG_NUM_CTX ?? 8192),
@@ -74,6 +76,43 @@ const creds = {
 let tokensSinceLast = 0;
 let heartbeatStarted = false;
 let heartbeatTimer = null;
+
+// ---------- Log-Puffer (für „Logs anfordern" im Dashboard) ----------
+let logsRequested = false;
+const LOG_RING = [];
+const LOG_RING_MAX = 200;
+function pushLog(level, args) {
+  try {
+    const line = args
+      .map((a) => (typeof a === "string" ? a : JSON.stringify(a)))
+      .join(" ");
+    LOG_RING.push(`${new Date().toISOString()} [${level}] ${line}`);
+    if (LOG_RING.length > LOG_RING_MAX) LOG_RING.shift();
+  } catch {
+    /* Logging darf nie crashen */
+  }
+}
+for (const level of ["log", "warn", "error"]) {
+  const orig = console[level].bind(console);
+  console[level] = (...args) => {
+    pushLog(level, args);
+    orig(...args);
+  };
+}
+
+/** Sammelt Agent-Logs (Ring) + Ollama-Log (Tail) für die Logs-Anforderung. */
+function getRecentLogs() {
+  const agent = LOG_RING.slice(-120).join("\n");
+  let ollama = "(keine Ollama-Log-Datei konfiguriert – CAG_OLLAMA_LOG)";
+  if (CFG.ollamaLog) {
+    try {
+      ollama = readFileSync(CFG.ollamaLog, "utf8").split("\n").slice(-120).join("\n");
+    } catch (e) {
+      ollama = `(Ollama-Log nicht lesbar: ${e?.message ?? e})`;
+    }
+  }
+  return `=== Agent v${CFG.version} ===\n${agent}\n\n=== Ollama (${CFG.ollamaLog || "n/a"}) ===\n${ollama}`.slice(-18000);
+}
 
 const SETUP_HTML = (() => {
   try {
@@ -702,6 +741,9 @@ async function sendHeartbeat() {
   const ollama = await pingOllama();
   // Tool-fähige Modelle (gecacht) – die Plattform nutzt das autoritativ.
   const toolModels = ollama.ok ? await getToolModels(ollama.models) : [];
+  // Logs nur anhängen, wenn angefordert (One-Shot).
+  const recentLogs = logsRequested ? getRecentLogs() : null;
+  logsRequested = false;
 
   const tokens = tokensSinceLast;
   tokensSinceLast = 0;
@@ -729,6 +771,7 @@ async function sendHeartbeat() {
         // Modell-Distribution: installierte Modelle + laufender Pull
         installed_models: ollama.models,
         tool_models: toolModels,
+        ...(recentLogs ? { recent_logs: recentLogs } : {}),
         pulling_model: pullingModel,
         pull_progress: pullProgress,
       }),
@@ -750,6 +793,8 @@ async function sendHeartbeat() {
       // Manuelles Löschen (Admin) – gibt Disk frei
       if (Array.isArray(data?.delete_models) && data.delete_models.length)
         deleteModels(data.delete_models); // fire-and-forget
+      // Logs-Anforderung (Admin) – Tail im nächsten Heartbeat anhängen
+      if (data?.logs) logsRequested = true;
       console.log(`💓 Heartbeat ok – GPU ${util}%, VRAM ${memTotalMb}MB, +${tokens} Token`);
     }
   } catch (e) {
