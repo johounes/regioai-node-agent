@@ -1,11 +1,12 @@
 # ProximaEU – Node-Agent
 
-Die **Node-Software** von [ProximaEU](https://regio-ai.vercel.app).
+Die **Node-Software** von [ProximaEU](https://app.proximaeu.de).
 Sie läuft auf deinem GPU-Rechner, umschließt [Ollama](https://ollama.com) und
 verbindet deine Maschine mit der Plattform:
 
-- stellt `POST /v1/chat` und `POST /v1/swarm/forward` bereit (Ziel der Gateway-Weiterleitung),
-- übersetzt diese auf Ollama (`/api/chat`),
+- stellt `POST /v1/chat`, `POST /v1/swarm/forward` und `POST /v1/embed` bereit
+  (Ziel der Gateway-Weiterleitung) sowie `GET /health`,
+- übersetzt diese auf Ollama (`/api/chat` bzw. `/api/embeddings`),
 - sendet regelmäßig einen **Heartbeat** (Status, GPU-Auslastung, VRAM, Token, `endpoint_url`).
 
 > Dieses Repository wird automatisch als Docker-Image nach
@@ -20,7 +21,7 @@ verbindet deine Maschine mit der Plattform:
 Auf dem PC, der zur Node werden soll, **einen Befehl** ausführen:
 
 ```bash
-curl -fsSL https://regio-ai.vercel.app/install.sh | bash
+curl -fsSL https://app.proximaeu.de/install.sh | bash
 ```
 
 Das Skript
@@ -33,7 +34,7 @@ Das Skript
 6. lädt das KI-Modell (`llama3:8b`) und wartet, bis deine Node **online** ist.
 
 Danach erscheint die Node in deinem
-[Operator-Dashboard](https://regio-ai.vercel.app/dashboard/operator).
+[Operator-Dashboard](https://app.proximaeu.de/dashboard/operator).
 
 ---
 
@@ -76,18 +77,30 @@ Alle Werte werden vom Install-Skript in `~/cag-node/.env` gesetzt. Relevante Var
 | `PORT` | `8080` | Port des Agents |
 | `HEARTBEAT_INTERVAL` | `60` | Heartbeat-Intervall (Sek.) |
 | `CAG_PUBLIC_URL` | `http://localhost:8080` | als `endpoint_url` gemeldete Adresse |
-| `CAG_GPU_MEMORY_MB` | `24576` | VRAM-Fallback, falls `nvidia-smi` fehlt |
+| `CAG_GPU_MEMORY_MB` | `0` | VRAM-Fallback, nur falls `nvidia-smi` fehlt (sonst automatisch erkannt) |
 | `CAG_AUTO_UPDATE` | `true` | Self-Update an/aus (`false` = nie automatisch aktualisieren) |
-| `CAG_UPDATE_URL` | GitHub-Raw `agent.mjs` | Quelle für das Self-Update |
+| `CAG_MANIFEST_URL` | GitHub-Raw `manifest.json` | signiertes Update-Manifest (Einstiegspunkt des Self-Updates) |
+| `CAG_UPDATE_HOSTS` | `raw.githubusercontent.com` | Host-Allowlist für Update-Downloads (nur https) |
+| `CAG_ALLOW_UNSIGNED` | `false` | **Notausschalter**: akzeptiert `/v1/*` OHNE Gateway-Signatur. Nur zum Debuggen – im Normalbetrieb `false` lassen (sonst offener GPU-Proxy). |
 
 ---
 
 ## Auto-Update
 
-Der Agent prüft (heartbeat-getaktet, **max. 1×/Stunde** + beim Start) die im Repo
-veröffentlichte `agent.mjs`-Version. Ist sie neuer, lädt er sie, prüft die **Syntax**
-(`node --check`) und ersetzt sich selbst, dann `exit(0)`. Der Supervisor startet den
-Prozess mit dem neuen Code neu:
+Der Agent prüft (heartbeat-getaktet, **max. 1×/Stunde** + beim Start) auf eine neue
+Version. Das Self-Update ist **kryptografisch abgesichert** (kein blindes Nachladen):
+
+1. Er holt zuerst ein **signiertes Manifest** (`CAG_MANIFEST_URL`) und verifiziert dessen
+   **Ed25519-Signatur** gegen die fest im Agent eingebetteten `TRUSTED_UPDATE_KEYS`
+   (rotierbar über Key-IDs).
+2. Erst dann lädt er die neue `agent.mjs` und prüft deren **sha256** gegen den im
+   signierten Manifest hinterlegten Hash – plus einen Versions-String-Abgleich im Code.
+3. Alle URLs müssen **https** sein und die **Host-Allowlist** (`CAG_UPDATE_HOSTS`,
+   Default `raw.githubusercontent.com`) bestehen.
+4. Zuletzt ein **Syntax-Check** (`node --check`), dann ersetzt er sich selbst und `exit(0)`.
+
+Nur wenn Signatur **und** Hash **und** Version **und** Host **und** Syntax passen, wird das
+Update übernommen. Der Supervisor startet den Prozess mit dem neuen Code neu:
 
 - **Docker:** `restart: unless-stopped` startet denselben Container neu (der überschriebene
   `agent.mjs` bleibt im Writable-Layer erhalten).
@@ -108,7 +121,7 @@ Für Tests ohne das Install-Skript kann das Image direkt verwendet werden:
 
 ```bash
 docker run -d --name cag-agent --gpus all -p 8080:8080 \
-  -e CAG_GATEWAY=https://regio-ai.vercel.app \
+  -e CAG_GATEWAY=https://app.proximaeu.de \
   -e CAG_NODE_ID=<deine-node-id> \
   -e CAG_NODE_KEY=cagnode_xxx \
   -e OLLAMA_URL=http://host.docker.internal:11434 \
@@ -125,11 +138,11 @@ Health-Check:
 
 ```bash
 curl http://localhost:8080/health
-# {"ok":true,"model":"llama3:8b","version":"0.3.0","enrolled":true}
+# {"ok":true,"model":"llama3:8b","version":"0.6.6","enrolled":true,"ollama":true,"models":["llama3:8b"]}
 ```
 
 ---
 
 ## Lizenz & Plattform
 
-Teil von **ProximaEU** · https://regio-ai.vercel.app
+Teil von **ProximaEU** · https://app.proximaeu.de

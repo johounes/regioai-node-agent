@@ -23,7 +23,13 @@ import {
 } from "node:fs";
 import { hostname, totalmem } from "node:os";
 import { fileURLToPath } from "node:url";
-import { createHash, createPublicKey, verify } from "node:crypto";
+import {
+  createHash,
+  createHmac,
+  createPublicKey,
+  timingSafeEqual,
+  verify,
+} from "node:crypto";
 
 try {
   process.loadEnvFile(new URL("./.env", import.meta.url));
@@ -49,7 +55,7 @@ const CFG = {
   controlBind: process.env.CAG_CONTROL_BIND ?? "127.0.0.1",
   // Pfad zur Ollama-Log-Datei (von den Installern gesetzt). Leer = nur Agent-Logs.
   ollamaLog: process.env.CAG_OLLAMA_LOG ?? "",
-  version: "0.6.6",
+  version: "0.6.7",
   // Ollama-Generierung: Kontextfenster + max. Output-Token. Ohne diese Werte
   // greift ein Default, der lange Antworten abschneidet.
   numCtx: Number(process.env.CAG_NUM_CTX ?? 8192),
@@ -78,6 +84,40 @@ const creds = {
   nodeId: process.env.CAG_NODE_ID ?? "",
   nodeKey: process.env.CAG_NODE_KEY ?? "",
 };
+
+// Gateway→Node Request-Auth (P0.2): die /v1/*-Inferenz-Endpunkte akzeptieren nur
+// Anfragen, die das Gateway mit dem Shared Secret signiert hat. Schlüssel =
+// sha256(nodeKey) = der in der DB gespeicherte node_api_key. CAG_ALLOW_UNSIGNED=true
+// ist ein Notausschalter (Default: erzwingen) – NUR für Debug/Notfall.
+const ALLOW_UNSIGNED = process.env.CAG_ALLOW_UNSIGNED === "true";
+const SIG_MAX_SKEW_MS = 300_000;
+
+/** HMAC-Schlüssel: sha256(nodeKey) (== node_api_key in der DB). */
+function gatewaySigKey() {
+  return createHash("sha256").update(creds.nodeKey).digest("hex");
+}
+
+/**
+ * Prüft die Gateway-Signatur einer /v1/*-Anfrage gegen den ROHEN Body-String.
+ * Gibt true zurück, wenn gültig (oder der Notausschalter gesetzt ist).
+ */
+function verifyGatewaySignature(req, rawBody) {
+  if (ALLOW_UNSIGNED) return true;
+  if (!creds.nodeKey) return false; // nicht enrolled → nichts zu verifizieren
+  const ts = req.headers["x-cag-timestamp"];
+  const sig = req.headers["x-cag-signature"];
+  if (typeof ts !== "string" || typeof sig !== "string") return false;
+  const tsNum = Number(ts);
+  if (!Number.isFinite(tsNum) || Math.abs(Date.now() - tsNum) > SIG_MAX_SKEW_MS)
+    return false;
+  const bodyHash = createHash("sha256").update(rawBody).digest("hex");
+  const expected = createHmac("sha256", gatewaySigKey())
+    .update(`${ts}.${req.url}.${bodyHash}`)
+    .digest("hex");
+  const a = Buffer.from(sig, "hex");
+  const b = Buffer.from(expected, "hex");
+  return a.length === b.length && timingSafeEqual(a, b);
+}
 
 let tokensSinceLast = 0;
 let heartbeatStarted = false;
@@ -541,6 +581,8 @@ function sendJson(res, status, obj) {
   res.end(JSON.stringify(obj));
 }
 
+// Liefert den ROHEN Body-String UND das geparste JSON. Der Rohstring wird für die
+// Gateway-Signaturprüfung gebraucht (Body-Hash muss byte-genau übereinstimmen).
 function readBody(req) {
   return new Promise((resolve, reject) => {
     let data = "";
@@ -550,7 +592,7 @@ function readBody(req) {
     });
     req.on("end", () => {
       try {
-        resolve(data ? JSON.parse(data) : {});
+        resolve({ raw: data, json: data ? JSON.parse(data) : {} });
       } catch (e) {
         reject(e);
       }
@@ -575,7 +617,7 @@ const server = createServer(async (req, res) => {
       });
     }
     if (req.method === "POST" && req.url === "/api/local/complete") {
-      const body = await readBody(req);
+      const { json: body } = await readBody(req);
       if (!body.node_id || !body.node_key) {
         return sendJson(res, 400, { error: "node_id/node_key fehlen" });
       }
@@ -612,7 +654,10 @@ const server = createServer(async (req, res) => {
       });
     }
     if (req.method === "POST" && (req.url === "/v1/chat" || req.url === "/v1/swarm/forward")) {
-      const body = await readBody(req);
+      const { raw, json: body } = await readBody(req);
+      if (!verifyGatewaySignature(req, raw)) {
+        return sendJson(res, 401, { error: "Ungültige oder fehlende Gateway-Signatur" });
+      }
       if (body.stream === true) {
         return await streamOllama(
           res,
@@ -625,7 +670,10 @@ const server = createServer(async (req, res) => {
     }
     // Embeddings (RAG): das Gateway bettet Doku-Chunks/Fragen hier ein.
     if (req.method === "POST" && req.url === "/v1/embed") {
-      const body = await readBody(req);
+      const { raw, json: body } = await readBody(req);
+      if (!verifyGatewaySignature(req, raw)) {
+        return sendJson(res, 401, { error: "Ungültige oder fehlende Gateway-Signatur" });
+      }
       return sendJson(res, 200, await embedOllama(body.model, body.input));
     }
     sendJson(res, 404, { error: "Not found" });
@@ -972,6 +1020,7 @@ server.listen(CFG.port, () => {
   console.log(`   Ollama:       ${CFG.ollamaUrl} (Modell ${CFG.model})`);
   console.log(`   endpoint_url: ${CFG.publicUrl}`);
   console.log(`   Auto-Update:  ${CFG.autoUpdate ? "an (CAG_AUTO_UPDATE=false zum Abschalten)" : "aus"}`);
+  console.log(`   Gateway-Auth: ${ALLOW_UNSIGNED ? "AUS (CAG_ALLOW_UNSIGNED=true – unsicher!)" : "an (signierte /v1/*-Anfragen erzwungen)"}`);
 
   if (!creds.nodeId || !creds.nodeKey) {
     const file = loadCredentialsFromFile();
